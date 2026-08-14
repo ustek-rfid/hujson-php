@@ -1,0 +1,27 @@
+{
+    "name": "ustek/hujson",
+    "description": "PHP port of tailscale/hujson: a parser and packer for the JWCC format (JSON With Commas and Comments).",
+    "type": "library",
+    "keywords": ["json", "jwcc", "hujson", "json5", "comments", "config"],
+    "license": "BSD-3-Clause",
+    "require": {
+        "php": ">=8.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5 || ^12.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ustek\\HuJSON\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ustek\\HuJSON\\Tests\\": "tests/"
+        }
+    },
+    "bin": ["bin/hujsonfmt"],
+    "config": {
+        "sort-packages": true
+    }
+}

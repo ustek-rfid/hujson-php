@@ -1,0 +1,318 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+namespace Ustek\HuJSON\Cli;
+
+use Ustek\HuJSON\HuJSON;
+use Ustek\HuJSON\HuJSONException;
+
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+/**
+ * hujsonfmt formats HuJSON, mirroring the Go cmd/hujsonfmt tool.
+ * Flags: -m minify, -s standardize, -d diff, -l list, -w write in place.
+ */
+final class HuJsonFmt
+{
+    private bool $min;
+    private bool $stand;
+    private bool $diff;
+    private bool $list;
+    private bool $write;
+
+    /** @param array<string,mixed> $opts */
+    public function __construct(array $opts)
+    {
+        $this->min = isset($opts['m']);
+        $this->stand = isset($opts['s']);
+        $this->diff = isset($opts['d']);
+        $this->list = isset($opts['l']);
+        $this->write = isset($opts['w']);
+    }
+
+    /** @param list<string> $paths */
+    public function run(array $paths): void
+    {
+        if ($paths === [] || (count($paths) === 1 && $paths[0] === '-')) {
+            if (stream_isatty(STDIN)) {
+                throw new CliError('no files paths or stdin provided');
+            }
+            if ($this->write) {
+                throw new CliError('cannot use -w with standard input');
+            }
+            $this->processFile('<standard input>', 'php://stdin', null);
+            return;
+        }
+
+        foreach ($paths as $arg) {
+            if (!file_exists($arg)) {
+                throw new CliError("stat $arg: no such file or directory");
+            }
+            if (is_dir($arg)) {
+                $it = new \RecursiveIteratorIterator(
+                    new \RecursiveDirectoryIterator($arg, \FilesystemIterator::SKIP_DOTS)
+                );
+                foreach ($it as $file) {
+                    /** @var \SplFileInfo $file */
+                    if ($file->isFile() && str_ends_with($file->getFilename(), '.hujson')) {
+                        $this->processFile($file->getPathname(), $file->getPathname(), $file->getPerms() & 0777);
+                    }
+                }
+            } else {
+                $this->processFile($arg, $arg, (fileperms($arg) ?: 0) & 0777);
+            }
+        }
+    }
+
+    private function processFile(string $displayName, string $readPath, ?int $perms): void
+    {
+        $src = file_get_contents($readPath);
+        if ($src === false) {
+            throw new CliError("cannot read $displayName");
+        }
+
+        $output = $this->transform($src);
+
+        if ($this->diff) {
+            $this->printDiff($displayName, $src, $output);
+        } elseif ($this->list) {
+            if ($src !== $output) {
+                echo $displayName . "\n";
+            }
+        } elseif ($this->write) {
+            if ($perms === null) {
+                throw new CliError('-w should not have been allowed with standard input');
+            }
+            $this->writeFile($readPath, $src, $output, $perms);
+        } else {
+            echo $output;
+        }
+    }
+
+    private function transform(string $src): string
+    {
+        if ($this->min) {
+            return HuJSON::minimize($src);
+        }
+        if ($this->stand) {
+            return HuJSON::standardize($src);
+        }
+        return HuJSON::format($src);
+    }
+
+    private function writeFile(string $filename, string $src, string $data, int $perms): void
+    {
+        $dir = \dirname($filename);
+        $bak = tempnam($dir, basename($filename));
+        if ($bak === false) {
+            throw new CliError("cannot create backup for $filename");
+        }
+        @chmod($bak, $perms);
+        if (file_put_contents($bak, $src) === false) {
+            @unlink($bak);
+            throw new CliError("cannot write backup for $filename");
+        }
+        if (file_put_contents($filename, $data) === false) {
+            @rename($bak, $filename);
+            throw new CliError("cannot write $filename");
+        }
+        @chmod($filename, $perms);
+        @unlink($bak);
+    }
+
+    private function printDiff(string $filename, string $src, string $modified): void
+    {
+        $orig = $filename . '.orig';
+        $diff = self::unifiedDiff($orig, $filename, $src, $modified);
+        if ($diff === '') {
+            return;
+        }
+        echo "diff $orig $filename\n";
+        echo $diff . "\n";
+    }
+
+    /** unifiedDiff produces a minimal unified diff (line-based, LCS, 3 lines of context). */
+    private static function unifiedDiff(string $origName, string $newName, string $old, string $new): string
+    {
+        if ($old === $new) {
+            return '';
+        }
+        $a = $old === '' ? [] : explode("\n", $old);
+        $b = $new === '' ? [] : explode("\n", $new);
+        $na = count($a);
+        $nb = count($b);
+
+        // Longest common subsequence table.
+        $lcs = array_fill(0, $na + 1, array_fill(0, $nb + 1, 0));
+        for ($i = $na - 1; $i >= 0; $i--) {
+            for ($j = $nb - 1; $j >= 0; $j--) {
+                $lcs[$i][$j] = $a[$i] === $b[$j]
+                    ? $lcs[$i + 1][$j + 1] + 1
+                    : max($lcs[$i + 1][$j], $lcs[$i][$j + 1]);
+            }
+        }
+
+        // Backtrack into a list of ops: [' '|'-'|'+', line].
+        $ops = [];
+        $i = 0;
+        $j = 0;
+        while ($i < $na && $j < $nb) {
+            if ($a[$i] === $b[$j]) {
+                $ops[] = [' ', $a[$i]];
+                $i++;
+                $j++;
+            } elseif ($lcs[$i + 1][$j] >= $lcs[$i][$j + 1]) {
+                $ops[] = ['-', $a[$i]];
+                $i++;
+            } else {
+                $ops[] = ['+', $b[$j]];
+                $j++;
+            }
+        }
+        for (; $i < $na; $i++) {
+            $ops[] = ['-', $a[$i]];
+        }
+        for (; $j < $nb; $j++) {
+            $ops[] = ['+', $b[$j]];
+        }
+
+        return self::renderHunks($origName, $newName, $ops, $na, $nb);
+    }
+
+    /**
+     * @param list<array{0:string,1:string}> $ops
+     */
+    private static function renderHunks(string $origName, string $newName, array $ops, int $na, int $nb): string
+    {
+        $context = 3;
+        // Indices of changed ops.
+        $changed = [];
+        foreach ($ops as $k => $op) {
+            if ($op[0] !== ' ') {
+                $changed[] = $k;
+            }
+        }
+        if ($changed === []) {
+            return '';
+        }
+
+        // Group changed regions that are within 2*context of each other.
+        $groups = [];
+        $start = $changed[0];
+        $prev = $changed[0];
+        foreach (array_slice($changed, 1) as $c) {
+            if ($c - $prev > 2 * $context) {
+                $groups[] = [$start, $prev];
+                $start = $c;
+            }
+            $prev = $c;
+        }
+        $groups[] = [$start, $prev];
+
+        $out = "--- $origName\n+++ $newName\n";
+        foreach ($groups as [$gStart, $gEnd]) {
+            $from = max(0, $gStart - $context);
+            $to = min(count($ops) - 1, $gEnd + $context);
+
+            $aStart = 0;
+            $aCount = 0;
+            $bStart = 0;
+            $bCount = 0;
+            $body = '';
+            for ($k = 0; $k <= $to; $k++) {
+                $op = $ops[$k];
+                $inHunk = $k >= $from;
+                if ($op[0] === ' ') {
+                    if ($inHunk) {
+                        if ($aCount === 0) {
+                            $aStart = $k;
+                        }
+                        if ($bCount === 0) {
+                            $bStart = $k;
+                        }
+                        $body .= ' ' . $op[1] . "\n";
+                        $aCount++;
+                        $bCount++;
+                    }
+                } elseif ($op[0] === '-') {
+                    if ($inHunk) {
+                        if ($aCount === 0) {
+                            $aStart = $k;
+                        }
+                        $body .= '-' . $op[1] . "\n";
+                        $aCount++;
+                    }
+                } else {
+                    if ($inHunk) {
+                        if ($bCount === 0) {
+                            $bStart = $k;
+                        }
+                        $body .= '+' . $op[1] . "\n";
+                        $bCount++;
+                    }
+                }
+            }
+            // Translate op indices to line numbers.
+            [$aLine, $bLine] = self::lineNumbers($ops, $from);
+            $aHdr = $aCount === 0 ? $aLine : $aLine + 1;
+            $bHdr = $bCount === 0 ? $bLine : $bLine + 1;
+            $out .= "@@ -{$aHdr},{$aCount} +{$bHdr},{$bCount} @@\n" . $body;
+        }
+        return rtrim($out, "\n");
+    }
+
+    /**
+     * @param list<array{0:string,1:string}> $ops
+     * @return array{0:int,1:int}
+     */
+    private static function lineNumbers(array $ops, int $upto): array
+    {
+        $aLine = 0;
+        $bLine = 0;
+        for ($k = 0; $k < $upto; $k++) {
+            $t = $ops[$k][0];
+            if ($t === ' ') {
+                $aLine++;
+                $bLine++;
+            } elseif ($t === '-') {
+                $aLine++;
+            } else {
+                $bLine++;
+            }
+        }
+        return [$aLine, $bLine];
+    }
+}
+
+final class CliError extends \RuntimeException
+{
+}
+
+function usage(): void
+{
+    fwrite(STDERR, "usage: hujsonfmt [flags] [path ...]\n");
+    fwrite(STDERR, "  -m  minify results\n");
+    fwrite(STDERR, "  -s  standardize results to plain JSON\n");
+    fwrite(STDERR, "  -d  display diffs instead of rewriting files\n");
+    fwrite(STDERR, "  -l  list files whose formatting differs\n");
+    fwrite(STDERR, "  -w  write result to (source) file instead of stdout\n");
+}
+
+$optind = 1;
+$opts = getopt('msdlw', [], $optind);
+$paths = array_values(array_slice($argv, $optind));
+
+try {
+    (new HuJsonFmt($opts ?: []))->run($paths);
+} catch (CliError | HuJSONException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    usage();
+    exit(1);
+}

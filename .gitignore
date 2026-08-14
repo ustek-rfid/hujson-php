@@ -1,0 +1,7 @@
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/.phpunit.result.cache
+
+# Local-only Go differential oracle (not distributed).
+/testref/
